@@ -155,3 +155,35 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic Conditional Payment Updates (`paid_at IS NULL`)
+
+In a distributed edge environment like Cloudflare Workers, handling payments with a separate "read-then-write" query creates a Time-of-Check to Time-of-Use (TOCTOU) race condition where concurrent requests could mark the same share paid twice. To eliminate this race condition without distributed locking, we execute a single atomic SQL statement directly against SQLite/D1:
+
+```sql
+UPDATE shares
+SET paid_at = ?1, idempotency_key = ?2
+WHERE id = ?3 AND bill_id = ?4 AND paid_at IS NULL
+RETURNING id, member_id, amount_cents, paid_at;
+```
+
+Because SQLite's primary write coordinator serializes write transactions, only the first request matches `paid_at IS NULL`, writes the timestamp, and returns the updated row. Concurrent or subsequent requests update zero rows and evaluate to `null`, completely preventing double payments.
+
+### 2. Deterministic Integer-Cent Remainder Allocation
+
+To avoid floating-point rounding errors and ensure financial accuracy, all monetary values are stored strictly as integer cents. When an expense does not divide evenly among $N$ home members, integer division yields a `base = Math.floor(totalCents / N)` and a remainder `R = totalCents % N` (where $0 \le R < N$). We allocate the extra 1 cent to the first $R$ members ordered deterministically by their database insertion ID (`ORDER BY m.id ASC`):
+
+```typescript
+const amountCents = baseCents + (index < remainder ? 1 : 0)
+```
+
+This mathematical guarantee ensures that the sum of all individual shares strictly equals `totalCents` ($\sum s_i = totalCents$), eliminates rounding discrepancies, allows valid zero-cent shares on underfunded splits, and guarantees deterministic allocation order.
+
+### 3. Per-Share Idempotency Handling
+
+Network timeouts or retries can cause clients to replay payment requests. Rather than enforcing a global uniqueness constraint on idempotency keys (which would prevent a user from paying multiple shares within the same checkout or retry batch), idempotency is scoped per share (`WHERE id = ?`):
+- When a payment request arrives for an already-paid share, the endpoint retrieves the existing record.
+- If the stored `idempotency_key` matches the request's `Idempotency-Key` header, the request is recognized as a safe replay and returns HTTP 200 with the original payment payload.
+- If the share was already paid with a different idempotency key, it returns HTTP 409 Conflict (`"Share already paid with a different key"`).
